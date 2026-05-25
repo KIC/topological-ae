@@ -8,6 +8,7 @@ import numpy as np
 from dotenv import load_dotenv
 from torch_topological.nn import SignatureLoss, VietorisRipsComplex
 from ignite.handlers.wandb_logger import WandBLogger, OutputHandler, OptimizerParamsHandler
+from ignite.handlers import Checkpoint, DiskSaver
 from ignite.engine import Engine, Events
 from ignite.metrics import Average
 from torch.utils.data import Dataset, DataLoader
@@ -130,6 +131,19 @@ def create_topo_train_step(model, optimizer, lam, device, report_trustworthiness
     return train_step
 
 
+def load_checkpoint(
+    checkpoint_path: str | Path,
+    model: Autoencoder,
+    optimizer: torch.optim.Optimizer,
+    trainer: Engine,
+) -> None:
+    checkpoint = torch.load(checkpoint_path, weights_only=False)
+    Checkpoint.load_objects(
+        to_load={"model": model, "optimizer": optimizer, "trainer": trainer},
+        checkpoint=checkpoint,
+    )
+
+
 if __name__ == '__main__':
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = Autoencoder(use_bn=True).to(device)
@@ -142,8 +156,8 @@ if __name__ == '__main__':
         config={"learning_rate": 1e-3, "lam": 1.0}
     )
 
-    trainer = Engine(create_topo_train_step(model, optimizer, lam=1.0, device=device, is_training=True))
-    evaluator = Engine(create_topo_train_step(model, optimizer, lam=1.0, device=device, is_training=False))
+    trainer = Engine(create_topo_train_step(model, optimizer, lam=1.0, device=device, is_training=True, report_trustworthiness=True))
+    evaluator = Engine(create_topo_train_step(model, optimizer, lam=1.0, device=device, is_training=False, report_trustworthiness=True))
 
     print("Loading data...")
     train_loader = DataLoader(
@@ -218,5 +232,23 @@ if __name__ == '__main__':
             print(f"Test {name}: {value:.4f}")
         print("-" * 30 + "\n")
 
+
+
+    # Configure a saver that writes to disk
+    checkpoint_handler = Checkpoint(
+        {"model": model, "optimizer": optimizer, "trainer": trainer},
+        DiskSaver(dirname="./snapshots", create_dir=True),
+        n_saved=3,
+        filename_prefix="epoch_",
+        score_function=None,
+    )
+
+    # Attach to trainer so it runs after each epoch
+    trainer.add_event_handler(Events.EPOCH_COMPLETED, checkpoint_handler)
+
+    resume_from = None  # set to a snapshot path to resume, e.g. "./snapshots/epoch__checkpoint_3.pt"
+    if resume_from:
+        load_checkpoint(resume_from, model, optimizer, trainer)
+        print(f"Resumed from {resume_from} (epoch {trainer.state.epoch})")
 
     trainer.run(train_loader, max_epochs=10)
