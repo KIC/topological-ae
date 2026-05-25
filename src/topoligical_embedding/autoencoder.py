@@ -1,5 +1,6 @@
 from pathlib import Path
 
+from ignite.handlers import ProgressBar
 import torch
 import torch.nn as nn
 import numpy as np
@@ -16,7 +17,7 @@ load_dotenv()
 
 
 class Autoencoder(nn.Module):
-    def __init__(self, input_dim=20, latent_dim=5, hidden_dims=(64, 32, 16), use_bn=False):
+    def __init__(self, input_dim=21, latent_dim=5, hidden_dims=(64, 64, 32, 16), use_bn=False):
         super().__init__()
 
         enc_layers = []
@@ -51,16 +52,34 @@ class Autoencoder(nn.Module):
 
 
 class NumpyDataset(Dataset):
-    def __init__(self, training_data: str | Path, training_labels: str | Path | None = None, mmap_mode: bool = False):
-        self.features = np.load(training_data, mmap_mode=('r+' if mmap_mode else None))
-        self.labels = np.load(training_labels) if training_labels is not None else None
+    def __init__(
+        self,
+        training_data: str | Path, 
+        training_labels: str | Path | None = None, 
+        mmap_mode: bool = False,
+        device: torch.device | None = None
+    ):
+        self.features = torch.from_numpy(np.load(training_data, mmap_mode=('r+' if mmap_mode else None)))
+        self.labels = torch.from_numpy(np.load(training_labels)) if training_labels is not None else None
+        self.device = device if not mmap_mode else None
+
+        if device and not mmap_mode:
+            self.features = self.features.to(device)
+            self.labels = self.labels.to(device) if self.labels is not None else None
 
     def __len__(self):
         return self.features.shape[0]
 
     def __getitem__(self, idx):
         features = self.features[idx]
-        return features, self.labels[idx] if self.labels is not None else features
+        labels = self.labels[idx] if self.labels is not None else features
+
+        if self.device:
+            features = features.to(self.device)
+            if self.labels:
+                labels = labels.to(self.device)
+
+        return features, labels
 
 
 def create_topo_train_step(model, optimizer, lam, device, report_trustworthiness=False, is_training=True):
@@ -69,40 +88,37 @@ def create_topo_train_step(model, optimizer, lam, device, report_trustworthiness
     similarity = nn.CosineSimilarity()
     vr = VietorisRipsComplex(dim=0)
     
-    # This is the actual closure function Ignite will run
     def train_step(engine, batch):
-        model.train()
-        optimizer.zero_grad()
+        if is_training:
+            model.train()
+            optimizer.zero_grad()
+        else:
+            model.eval()
         
         x, _ = batch
         x = x.to(device)
         
-        # 1. Forward pass returns latent (z) and reconstruction (x_hat)
         z, x_hat = model(x)
         
         pi_x = vr(x)
         pi_z = vr(z)
 
-        # 2. Compute individual error fragments directly in the step
         topo_loss = topo_lossfn([x, pi_x], [z, pi_z])
         mse_loss = mse_lossfn(x, x_hat)
         direction_loss = torch.mean(1 - similarity(x, x_hat))
         
-        # 3. Compose total loss
         total_loss = mse_loss + direction_loss + (lam * topo_loss)
         
-        # 4. Optimization steps
         if is_training:
             total_loss.backward()
             optimizer.step()
 
         if report_trustworthiness:
             with torch.no_grad():
-                tw = trustworthiness(x, z)
+                tw = trustworthiness(x.cpu().numpy(), z.cpu().numpy())
         else:
-            tw = 0
+            tw = 0.0
         
-        # Return a dictionary of components for Ignite to monitor
         return {
             "total_loss": total_loss.item(),
             "mse_loss": mse_loss.item(),
@@ -115,85 +131,92 @@ def create_topo_train_step(model, optimizer, lam, device, report_trustworthiness
 
 
 if __name__ == '__main__':
-    # --- 2. INITIALIZE COMPONENTS ---
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = Autoencoder().to(device)
+    model = Autoencoder(use_bn=True).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
-    batch_size = 1024
+    batch_size = 1024 * 2
+    mmap_mode=False
 
     wandb_logger = WandBLogger(
         project="topological-autoencoder",
-        name="ignite-run",
         config={"learning_rate": 1e-3, "lam": 1.0}
     )
 
-    # Initialize your structural and topological loss functions here and create the engine
-    trainer = Engine(create_topo_train_step(model, optimizer, lam=1.0, device=device))
+    trainer = Engine(create_topo_train_step(model, optimizer, lam=1.0, device=device, is_training=True))
     evaluator = Engine(create_topo_train_step(model, optimizer, lam=1.0, device=device, is_training=False))
 
-    # create data loaders
+    print("Loading data...")
     train_loader = DataLoader(
-        NumpyDataset('/home/badger/data/sources/mine/quant/TorchSOM-1.1.1/pumap/vzscores32.npy.weighted.npy.shuffled.npy.train.npy'),
+        NumpyDataset(
+            #'/home/badger/data/sources/mine/quant/TorchSOM-1.1.1/pumap/vzscores32.npy.weighted.npy.shuffled.npy.train.npy',
+            '/home/badger/data/sources/mine/quant/TorchSOM-1.1.1/pumap/vzscores32.npy.weighted.npy.shuffled.npy.train.npy.shuffled.npy',
+            device=None,
+            mmap_mode=mmap_mode
+        ),
         batch_size=batch_size,
         shuffle=True,
-        drop_last=True
     )
 
     test_loader = DataLoader(
-        NumpyDataset('/home/badger/data/sources/mine/quant/TorchSOM-1.1.1/pumap/vzscores32.npy.weighted.npy.shuffled.npy.test.npy'),
+        NumpyDataset(
+            #'/home/badger/data/sources/mine/quant/TorchSOM-1.1.1/pumap/vzscores32.npy.weighted.npy.shuffled.npy.test.npy', 
+            '/home/badger/data/sources/mine/quant/TorchSOM-1.1.1/pumap/vzscores32.npy.weighted.npy.shuffled.npy.train.npy.shuffled.npy',
+            device=None, 
+            mmap_mode=mmap_mode,
+        ),
         batch_size=batch_size,
         shuffle=False,
-        drop_last=False
     )
 
-    # Attach running average metrics to the engine 
+    print("Starting training...")
     metrics = ["total_loss", "mse_loss", "direction_loss", "topo_loss", "trustworthiness"]
     for metric_name in metrics:
         Average(output_transform=lambda x, m=metric_name: x[m]).attach(trainer, metric_name)
         Average(output_transform=lambda x, m=metric_name: x[m]).attach(evaluator, metric_name)
 
-    # 4. Attach the logger to track metrics every iteration (or change to Events.EPOCH_COMPLETED)
-    wandb_logger.attach(
-        trainer,
-        log_handler=OutputHandler(
-            tag="training",
-            metric_names=metrics # This reads the attached metrics from step 2
-        ),
-        event_name=Events.ITERATION_COMPLETED
-    )
+    ProgressBar(persist=True).attach(trainer, metric_names=metrics)
 
-    # Optional: Track the learning rate over time
     wandb_logger.attach(
         trainer,
         log_handler=OptimizerParamsHandler(optimizer),
-        event_name=Events.ITERATION_COMPLETED
+        event_name=Events.EPOCH_COMPLETED
     )
 
-
-    # 3. Connect the test engine to WandB (just like the trainer)
     wandb_logger.attach(
-        evaluator,
+        trainer,
         log_handler=OutputHandler(
-            tag="test",
+            tag="train",
             metric_names=metrics,
-            global_step_transform=lambda *_: trainer.state.epoch # Plugs neatly into your epoch timeline
+            global_step_transform=lambda engine, event: engine.state.epoch,
         ),
         event_name=Events.EPOCH_COMPLETED
     )
 
-    # Event handlers
+    wandb_logger.attach(
+        evaluator,
+        log_handler=OutputHandler(
+            tag="val",
+            metric_names=metrics,
+            global_step_transform=lambda engine, event: trainer.state.epoch,
+        ),
+        event_name=Events.EPOCH_COMPLETED
+    )
+
     @trainer.on(Events.EPOCH_COMPLETED)
     def run_test_set(engine):
-        model.eval()                     # Switch model to evaluation mode
-        with torch.no_grad():            # Turn off gradients to save memory and skip training updates
-            evaluator.run(test_loader)   # Run the exact same loop over test data
+        with torch.no_grad():            
+            evaluator.run(test_loader)   
 
-
-    # Make sure the wandb context closes cleanly when engine finishes
     @trainer.on(Events.COMPLETED)
     def end_wandb(engine):
         wandb_logger.close()
 
+    @evaluator.on(Events.EPOCH_COMPLETED)
+    def log_test_results(engine):
+        print(f"\n--- Epoch {trainer.state.epoch} Test Metrics ---")
+        for name, value in engine.state.metrics.items():
+            print(f"Test {name}: {value:.4f}")
+        print("-" * 30 + "\n")
 
-    # Finally train this shit
+
     trainer.run(train_loader, max_epochs=10)
