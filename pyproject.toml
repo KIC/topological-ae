@@ -1,0 +1,23 @@
+[project]
+name = "topoligical-embedding"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "KIC", email = "kic@github.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "dotenv>=0.9.9",
+    "pytorch-ignite>=0.5.4",
+    "torch-topological>=0.1.9",
+    "tqdm>=4.67.3",
+    "wandb>=0.27.0",
+]
+
+[project.scripts]
+topoligical-embedding = "topoligical_embedding:main"
+
+[build-system]
+requires = ["uv_build>=0.11.16,<0.12.0"]
+build-backend = "uv_build"
