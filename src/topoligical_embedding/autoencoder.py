@@ -8,7 +8,7 @@ import numpy as np
 from dotenv import load_dotenv
 from torch_topological.nn import SignatureLoss, VietorisRipsComplex
 from ignite.handlers.wandb_logger import WandBLogger, OutputHandler, OptimizerParamsHandler
-from ignite.handlers import Checkpoint, DiskSaver
+from ignite.handlers import Checkpoint, DiskSaver, EarlyStopping
 from ignite.engine import Engine, Events
 from ignite.metrics import Average
 from torch.utils.data import Dataset, DataLoader
@@ -83,7 +83,7 @@ class NumpyDataset(Dataset):
         return features, labels
 
 
-def create_topo_train_step(model, optimizer, lam, device, report_trustworthiness=False, is_training=True):
+def create_topo_train_step(model, optimizer, lam, device, report_trustworthiness=False, noise=None, is_training=True):
     topo_lossfn = SignatureLoss(p=2)
     mse_lossfn = torch.nn.MSELoss()
     similarity = nn.CosineSimilarity()
@@ -99,7 +99,10 @@ def create_topo_train_step(model, optimizer, lam, device, report_trustworthiness
         x, _ = batch
         x = x.to(device)
         
-        z, x_hat = model(x)
+        # Add noise to features, should make it more stable
+        x_noisy = (x + noise * torch.randn_like(x)) if noise is not None else x
+        
+        z, x_hat = model(x_noisy)
         
         pi_x = vr(x)
         pi_z = vr(z)
@@ -162,10 +165,10 @@ if __name__ == '__main__':
     print("Loading data...")
     train_loader = DataLoader(
         NumpyDataset(
-            #'/home/badger/data/sources/mine/quant/TorchSOM-1.1.1/pumap/vzscores32.npy.weighted.npy.shuffled.npy.train.npy',
-            '/home/badger/data/sources/mine/quant/TorchSOM-1.1.1/pumap/vzscores32.npy.weighted.npy.shuffled.npy.train.npy.shuffled.npy',
-            device=None,
-            mmap_mode=mmap_mode
+            #'data/vzscores32.npy.weighted.npy.shuffled.npy.train.npy',
+            'data/vzscores32.npy.weighted.npy.shuffled.npy.train.npy.shuffled.npy',
+            device=device,
+            mmap_mode=False
         ),
         batch_size=batch_size,
         shuffle=True,
@@ -173,10 +176,10 @@ if __name__ == '__main__':
 
     test_loader = DataLoader(
         NumpyDataset(
-            #'/home/badger/data/sources/mine/quant/TorchSOM-1.1.1/pumap/vzscores32.npy.weighted.npy.shuffled.npy.test.npy', 
-            '/home/badger/data/sources/mine/quant/TorchSOM-1.1.1/pumap/vzscores32.npy.weighted.npy.shuffled.npy.train.npy.shuffled.npy',
-            device=None, 
-            mmap_mode=mmap_mode,
+            #'data/vzscores32.npy.weighted.npy.shuffled.npy.test.npy', 
+            'data/vzscores32.npy.weighted.npy.shuffled.npy.test.npy.shuffled.npy',
+            device=device, 
+            mmap_mode=False,
         ),
         batch_size=batch_size,
         shuffle=False,
@@ -189,6 +192,7 @@ if __name__ == '__main__':
         Average(output_transform=lambda x, m=metric_name: x[m]).attach(evaluator, metric_name)
 
     ProgressBar(persist=True).attach(trainer, metric_names=metrics)
+    ProgressBar(persist=False).attach(evaluator, metric_names=metrics)
 
     wandb_logger.attach(
         trainer,
@@ -232,8 +236,6 @@ if __name__ == '__main__':
             print(f"Test {name}: {value:.4f}")
         print("-" * 30 + "\n")
 
-
-
     # Configure a saver that writes to disk
     checkpoint_handler = Checkpoint(
         {"model": model, "optimizer": optimizer, "trainer": trainer},
@@ -245,6 +247,14 @@ if __name__ == '__main__':
 
     # Attach to trainer so it runs after each epoch
     trainer.add_event_handler(Events.EPOCH_COMPLETED, checkpoint_handler)
+
+    # Add early stopping
+    early_stopping = EarlyStopping(
+        patience=3,
+        score_function=lambda engine: -engine.state.metrics["total_loss"],
+        trainer=trainer,
+    )
+    evaluator.add_event_handler(Events.COMPLETED, early_stopping)
 
     resume_from = None  # set to a snapshot path to resume, e.g. "./snapshots/epoch__checkpoint_3.pt"
     if resume_from:
