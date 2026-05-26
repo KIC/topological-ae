@@ -1,10 +1,11 @@
-from pathlib import Path
-
-from ignite.handlers import ProgressBar
 import torch
 import torch.nn as nn
 import numpy as np
+import warnings
+warnings.filterwarnings("ignore", message="Provided metric name", module="ignite")
 
+from pathlib import Path
+from ignite.handlers import ProgressBar
 from dotenv import load_dotenv
 from torch_topological.nn import SignatureLoss, VietorisRipsComplex
 from ignite.handlers.wandb_logger import WandBLogger, OutputHandler, OptimizerParamsHandler
@@ -20,6 +21,7 @@ load_dotenv()
 class Autoencoder(nn.Module):
     def __init__(self, input_dim=21, latent_dim=5, hidden_dims=(64, 64, 32, 16), use_bn=False):
         super().__init__()
+        self._conf = dict(input_dim=input_dim, latent_dim=latent_dim, hidden_dims=hidden_dims, use_bn=use_bn)
 
         enc_layers = []
         prev = input_dim
@@ -83,7 +85,7 @@ class NumpyDataset(Dataset):
         return features, labels
 
 
-def create_topo_train_step(model, optimizer, lam, device, report_trustworthiness=False, noise=None, is_training=True):
+def create_topo_train_step(model, optimizer, lam, device, noise=None, report_trustworthiness=False, is_training=True):
     topo_lossfn = SignatureLoss(p=2)
     mse_lossfn = torch.nn.MSELoss()
     similarity = nn.CosineSimilarity()
@@ -117,11 +119,10 @@ def create_topo_train_step(model, optimizer, lam, device, report_trustworthiness
             total_loss.backward()
             optimizer.step()
 
+        tw = 0.0
         if report_trustworthiness:
             with torch.no_grad():
                 tw = trustworthiness(x.cpu().numpy(), z.cpu().numpy())
-        else:
-            tw = 0.0
         
         return {
             "total_loss": total_loss.item(),
@@ -149,18 +150,22 @@ def load_checkpoint(
 
 if __name__ == '__main__':
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = Autoencoder(use_bn=True).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    noise=0.05
+    lam=1.0
     batch_size = 1024 * 2
+    learning_rate = 1e-3
     mmap_mode=False
-
+    
+    model = Autoencoder(use_bn=True).to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+    
     wandb_logger = WandBLogger(
         project="topological-autoencoder",
-        config={"learning_rate": 1e-3, "lam": 1.0}
+        config={"learning_rate": learning_rate, "lam": lam, "batch_size": batch_size, "noise": noise, "model": model._conf}
     )
 
-    trainer = Engine(create_topo_train_step(model, optimizer, lam=1.0, device=device, is_training=True, report_trustworthiness=True))
-    evaluator = Engine(create_topo_train_step(model, optimizer, lam=1.0, device=device, is_training=False, report_trustworthiness=True))
+    trainer = Engine(create_topo_train_step(model, optimizer, lam=lam, device=device, noise=noise, is_training=True, report_trustworthiness=True))
+    evaluator = Engine(create_topo_train_step(model, optimizer, lam=lam, device=device, is_training=False, report_trustworthiness=True))
 
     print("Loading data...")
     train_loader = DataLoader(
@@ -192,7 +197,7 @@ if __name__ == '__main__':
         Average(output_transform=lambda x, m=metric_name: x[m]).attach(evaluator, metric_name)
 
     ProgressBar(persist=True).attach(trainer, metric_names=metrics)
-    ProgressBar(persist=False).attach(evaluator, metric_names=metrics)
+    ProgressBar(persist=False, desc="Validation").attach(evaluator, metric_names=metrics)
 
     wandb_logger.attach(
         trainer,
@@ -239,7 +244,7 @@ if __name__ == '__main__':
     # Configure a saver that writes to disk
     checkpoint_handler = Checkpoint(
         {"model": model, "optimizer": optimizer, "trainer": trainer},
-        DiskSaver(dirname="./snapshots", create_dir=True),
+        DiskSaver(dirname="./snapshots", create_dir=True, require_empty=False),
         n_saved=3,
         filename_prefix="epoch_",
         score_function=None,
@@ -261,4 +266,4 @@ if __name__ == '__main__':
         load_checkpoint(resume_from, model, optimizer, trainer)
         print(f"Resumed from {resume_from} (epoch {trainer.state.epoch})")
 
-    trainer.run(train_loader, max_epochs=10)
+    trainer.run(train_loader, max_epochs=13)
