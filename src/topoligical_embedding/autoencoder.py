@@ -153,7 +153,7 @@ if __name__ == '__main__':
     noise=0.05
     lam=1.0
     batch_size = 1024 * 2
-    learning_rate = 1e-3
+    learning_rate = 1e-3 / 2
     mmap_mode=False
     
     model = Autoencoder(use_bn=True).to(device)
@@ -170,24 +170,26 @@ if __name__ == '__main__':
     print("Loading data...")
     train_loader = DataLoader(
         NumpyDataset(
-            #'data/vzscores32.npy.weighted.npy.shuffled.npy.train.npy',
-            'data/vzscores32.npy.weighted.npy.shuffled.npy.train.npy.shuffled.npy',
-            device=device,
-            mmap_mode=False
+            'data/vzscores32.npy.weighted.npy.shuffled.npy.train.npy',
+            #'data/vzscores32.npy.weighted.npy.shuffled.npy.train.npy.shuffled.npy',
+            #device=device,
+            mmap_mode=True
         ),
         batch_size=batch_size,
         shuffle=True,
+        num_workers=2,
     )
 
     test_loader = DataLoader(
         NumpyDataset(
-            #'data/vzscores32.npy.weighted.npy.shuffled.npy.test.npy', 
-            'data/vzscores32.npy.weighted.npy.shuffled.npy.test.npy.shuffled.npy',
-            device=device, 
-            mmap_mode=False,
+            'data/vzscores32.npy.weighted.npy.shuffled.npy.test.npy', 
+            #'data/vzscores32.npy.weighted.npy.shuffled.npy.test.npy.shuffled.npy',
+            #device=device, 
+            mmap_mode=True,
         ),
         batch_size=batch_size,
         shuffle=False,
+        num_workers=2,
     )
 
     print("Starting training...")
@@ -220,7 +222,7 @@ if __name__ == '__main__':
         log_handler=OutputHandler(
             tag="val",
             metric_names=metrics,
-            global_step_transform=lambda engine, event: trainer.state.epoch,
+            global_step_transform=lambda engine, event: engine.state.epoch,
         ),
         event_name=Events.EPOCH_COMPLETED
     )
@@ -232,6 +234,7 @@ if __name__ == '__main__':
 
     @trainer.on(Events.COMPLETED)
     def end_wandb(engine):
+        # calls wandb.finish internally
         wandb_logger.close()
 
     @evaluator.on(Events.EPOCH_COMPLETED)
@@ -245,7 +248,7 @@ if __name__ == '__main__':
     checkpoint_handler = Checkpoint(
         {"model": model, "optimizer": optimizer, "trainer": trainer},
         DiskSaver(dirname="./snapshots", create_dir=True, require_empty=False),
-        n_saved=3,
+        n_saved=10,
         filename_prefix="epoch_",
         score_function=None,
     )
